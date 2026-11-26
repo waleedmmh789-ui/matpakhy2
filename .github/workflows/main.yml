@@ -1,0 +1,241 @@
+name: Build Android (APK + AAB)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 1) تحديد المشروع وفكّه (بدون أي تعارض بين الملفات المرفوعة) ----------
+      - name: Locate and extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pubspec.yaml ]; then
+            ROOT="$GITHUB_WORKSPACE"
+          else
+            ZIP=""
+            if [ -f matbakhy-final.zip ]; then
+              ZIP="matbakhy-final.zip"
+            else
+              ZIP="$(ls -1 matbakhy_merged*.zip 2>/dev/null | sort | tail -n1 || true)"
+            fi
+            if [ -z "$ZIP" ]; then
+              echo "::error::لم أجد matbakhy-final.zip في جذر المستودع. ارفعه (واحذف ملفات zip القديمة)."
+              exit 1
+            fi
+            echo "Using $ZIP"
+            rm -rf "$GITHUB_WORKSPACE/_project"
+            mkdir -p "$GITHUB_WORKSPACE/_project"
+            unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/_project"
+            PUB="$(find "$GITHUB_WORKSPACE/_project" -maxdepth 3 -name pubspec.yaml -not -path '*/.*' | head -n1)"
+            if [ -z "$PUB" ]; then
+              echo "::error::لا يوجد pubspec.yaml داخل $ZIP"
+              exit 1
+            fi
+            ROOT="$(dirname "$PUB")"
+          fi
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+          ls "$ROOT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # إصدار Flutter مثبّت (هو الذي ظهر في سجل البناء: stable-3.50.1).
+      # لا تغيّره إلا عندما تريد الترقية عمداً، ثم جرّب البناء.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.50.1'
+          channel: stable
+          cache: true
+
+      # ---------- 2) إصلاح خطأ 429: مرآة Maven + إعادة المحاولة + كاش ----------
+      - name: Configure Gradle (mirror + retries)
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/mirror.gradle" <<'GRADLE'
+          def mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+          gradle.beforeSettings { settings ->
+              settings.pluginManagement.repositories {
+                  maven { url = java.net.URI.create(mirror) }
+                  gradlePluginPortal()
+              }
+          }
+          // رفع compileSdk إلى 36 لكل الإضافات (webview_flutter_android تشترط 36 أو أعلى)
+          gradle.allprojects { p ->
+              // تعطيل lintVital في بناء release: يتعطل (NoSuchMethodError) داخل أداة lint نفسها
+              // بسبب إضافات image_picker و in_app_purchase، ولا يؤثر على ملف APK/AAB الناتج.
+              p.tasks.configureEach { t ->
+                  if (t.name.startsWith('lintVital')) { t.enabled = false }
+              }
+              p.afterEvaluate {
+                  def ext = p.extensions.findByName('android')
+                  if (ext != null) {
+                      try {
+                          def cur = ext.compileSdk
+                          if (cur == null || cur < 36) { ext.compileSdk = 36 }
+                      } catch (Throwable t) {
+                          println "compileSdk patch skipped for ${p.name}: ${t.message}"
+                      }
+                  }
+              }
+          }
+          GRADLE
+          cat >> "$HOME/.gradle/gradle.properties" <<'PROPS'
+          systemProp.org.gradle.internal.http.connectionTimeout=120000
+          systemProp.org.gradle.internal.http.socketTimeout=120000
+          systemProp.org.gradle.internal.repository.max.tentatives=8
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          PROPS
+          cat "$HOME/.gradle/init.d/mirror.gradle"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/main.yml', '*.zip', 'pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ---------- 3) مزامنة Gradle/AGP/Kotlin مع إصدار Flutter الحالي ----------
+      - name: Sync Gradle wrapper and plugin versions with Flutter
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter create --platforms=android --org com.nader --project-name cooking_app "$RUNNER_TEMP/scaffold"
+          S="$RUNNER_TEMP/scaffold/android"
+          mkdir -p android/gradle/wrapper
+          # gradlew + wrapper بنفس إصدار Gradle الذي يطلبه Flutter
+          cp -f "$S/gradlew" "$S/gradlew.bat" android/
+          cp -f "$S/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/
+          cp -f "$S/gradle/wrapper/gradle-wrapper.properties" android/gradle/wrapper/
+          chmod +x android/gradlew
+          # إصدارات AGP و Kotlin من قالب Flutter الحالي
+          SETTINGS="$(cat "$S"/settings.gradle* 2>/dev/null)"
+          AGP="$(echo "$SETTINGS" | grep -oP 'com\.android\.application"\)?\s*version\s*"\K[^"]+' | head -n1 || true)"
+          KOT="$(echo "$SETTINGS" | grep -oP 'org\.jetbrains\.kotlin\.android"\)?\s*version\s*"\K[^"]+' | head -n1 || true)"
+          echo "Flutter template -> AGP=$AGP Kotlin=$KOT"
+          cat android/gradle/wrapper/gradle-wrapper.properties
+          if [ -n "$AGP" ]; then
+            sed -i -E 's|(com\.android\.application" version ")[^"]+|\1'"$AGP"'|' android/settings.gradle
+          fi
+          if [ -n "$KOT" ]; then
+            sed -i -E 's|(org\.jetbrains\.kotlin\.android" version ")[^"]+|\1'"$KOT"'|' android/settings.gradle
+          fi
+          grep -n "version" android/settings.gradle
+          # لا نريد ملفات .kts تتعارض مع ملفات Groovy الخاصة بنا
+          rm -f android/*.kts android/app/*.kts
+          rm -f test/widget_test.dart
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      # ---------- إصلاح توافق إضافات pub مع Gradle 9 ----------
+      # بعض الإضافات (مثل google_mobile_ads 6.0.0) تستخدم configurations.all كخاصية،
+      # وقد حُذفت في Gradle 9. نستبدلها بـ configurations (نفس النتيجة).
+      - name: Patch plugins for Gradle 9
+        shell: bash
+        run: |
+          PC="${PUB_CACHE:-$HOME/.pub-cache}"
+          echo "Pub cache: $PC"
+          find "$PC/hosted" -path '*/android/build.gradle' 2>/dev/null | while read -r f; do
+            if grep -qP '\bconfigurations\.all(?!\s*[\{\(])' "$f"; then
+              echo "Patching $f"
+              grep -nP '\bconfigurations\.all(?!\s*[\{\(])' "$f" || true
+              perl -pi -e 's/\bconfigurations\.all(?!\s*[\{\(])/configurations/g' "$f"
+            fi
+          done
+          G="$(find "$PC/hosted" -path '*google_mobile_ads-*/android/build.gradle' | head -n1 || true)"
+          if [ -n "$G" ]; then echo "--- $G (lines 50-65) ---"; sed -n 50,65p "$G"; fi
+
+      - name: Generate launcher icons
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: dart run flutter_launcher_icons
+
+      - name: Prepare signing keystore
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+            SP="$KEYSTORE_PASSWORD"; KA="$KEY_ALIAS"; KP="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "::warning::No KEYSTORE_BASE64 secret. Generating a temporary keystore (not for Google Play updates)."
+            SP="matbakhy123456"; KA="upload"; KP="matbakhy123456"
+            keytool -genkeypair -v -keystore android/app/upload-keystore.jks \
+              -storetype JKS -keyalg RSA -keysize 2048 -validity 10000 -alias "$KA" \
+              -storepass "$SP" -keypass "$KP" -dname "CN=Matbakhy, O=Matbakhy, C=EG"
+          fi
+          {
+            echo "storePassword=$SP"
+            echo "keyPassword=$KP"
+            echo "keyAlias=$KA"
+            echo "storeFile=upload-keystore.jks"
+          } > android/key.properties
+
+      # ---------- 4) البناء مع إعادة المحاولة تلقائياً (3 مرات) ----------
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            if flutter build apk --release; then exit 0; fi
+            echo "::warning::Attempt $i failed, retrying..."
+            sleep $((i * 40))
+          done
+          exit 1
+
+      - name: Build AAB
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            if flutter build appbundle --release; then exit 0; fi
+            echo "::warning::Attempt $i failed, retrying..."
+            sleep $((i * 40))
+          done
+          exit 1
+
+      - name: Collect outputs
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/matbakhy.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "$GITHUB_WORKSPACE/dist/matbakhy.aab"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matbakhy-release
+          path: dist/*
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

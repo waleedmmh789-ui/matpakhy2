@@ -20,29 +20,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- 1) تحديد المشروع وفكّه (بدون أي تعارض بين الملفات المرفوعة) ----------
+      # ---------- 1) تحديد المشروع وفكّه ----------
+      # الترتيب: (1) pubspec.yaml في الجذر  (2) مجلد مشروع مرفوع كملفات  (3) أي ملف zip في الجذر
+      # (حتى لو اسمه "matbakhy-final (7).zip" أو كان بداخله zip آخر).
       - name: Locate and extract project
         shell: bash
         run: |
           set -euo pipefail
+          echo "Workspace contents:"; ls -la "$GITHUB_WORKSPACE"
+          ROOT=""
           if [ -f pubspec.yaml ]; then
             ROOT="$GITHUB_WORKSPACE"
           else
-            ZIP=""
-            if [ -f matbakhy-final.zip ]; then
-              ZIP="matbakhy-final.zip"
-            else
-              ZIP="$(ls -1 matbakhy_merged*.zip 2>/dev/null | sort | tail -n1 || true)"
+            PUB="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name pubspec.yaml -not -path '*/.*' -not -path '*/_project/*' | head -n1 || true)"
+            if [ -n "$PUB" ]; then
+              ROOT="$(dirname "$PUB")"
             fi
+          fi
+          if [ -z "$ROOT" ]; then
+            ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -iname '*.zip' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2- || true)"
             if [ -z "$ZIP" ]; then
-              echo "::error::لم أجد matbakhy-final.zip في جذر المستودع. ارفعه (واحذف ملفات zip القديمة)."
+              echo "Files in repo root:"; ls -la "$GITHUB_WORKSPACE"
+              echo "::error::لا يوجد مشروع في المستودع: ارفع ملف المشروع (zip) أو ملفات المشروع نفسها (pubspec.yaml) في الصفحة الرئيسية للمستودع (main) ثم أعد التشغيل."
               exit 1
             fi
             echo "Using $ZIP"
             rm -rf "$GITHUB_WORKSPACE/_project"
             mkdir -p "$GITHUB_WORKSPACE/_project"
             unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/_project"
-            PUB="$(find "$GITHUB_WORKSPACE/_project" -maxdepth 3 -name pubspec.yaml -not -path '*/.*' | head -n1)"
+            # لو كان بداخله zip آخر (مشروع داخل zip) نفكّه أيضاً
+            PUB="$(find "$GITHUB_WORKSPACE/_project" -maxdepth 3 -name pubspec.yaml | head -n1 || true)"
+            if [ -z "$PUB" ]; then
+              find "$GITHUB_WORKSPACE/_project" -maxdepth 3 -iname '*.zip' | while read -r inner; do
+                echo "Unzipping nested $inner"
+                unzip -q -o "$inner" -d "$(dirname "$inner")/_inner_$(basename "$inner" .zip | tr ' ()' '___')"
+              done
+              PUB="$(find "$GITHUB_WORKSPACE/_project" -maxdepth 5 -name pubspec.yaml | head -n1 || true)"
+            fi
             if [ -z "$PUB" ]; then
               echo "::error::لا يوجد pubspec.yaml داخل $ZIP"
               exit 1
